@@ -22,6 +22,8 @@ message(STATUS "CXX standard: ${CMAKE_CXX_STANDARD}")
 cmake_policy(SET CMP0077 NEW)
 set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
 
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 # Sets new behavior for CMP0135, which controls how timestamps are extracted
 # when using ExternalProject_Add():
 # https://cmake.org/cmake/help/latest/policy/CMP0135.html

@@ -72,9 +72,7 @@ PlanBuilder& PlanBuilder::tableScan(
     const std::vector<std::string>& subfieldFilters,
     const std::string& remainingFilter,
     const RowTypePtr& dataColumns,
-    const std::unordered_map<
-        std::string,
-        std::shared_ptr<connector::ColumnHandle>>& assignments) {
+    const connector::ColumnHandleMap& assignments) {
   return TableScanBuilder(*this)
       .filtersAsNode(filtersAsNode_ ? planNodeIdGenerator_ : nullptr)
       .outputType(outputType)
@@ -92,9 +90,7 @@ PlanBuilder& PlanBuilder::tableScan(
     const std::vector<std::string>& subfieldFilters,
     const std::string& remainingFilter,
     const RowTypePtr& dataColumns,
-    const std::unordered_map<
-        std::string,
-        std::shared_ptr<connector::ColumnHandle>>& assignments) {
+    const connector::ColumnHandleMap& assignments) {
   return TableScanBuilder(*this)
       .filtersAsNode(filtersAsNode_ ? planNodeIdGenerator_ : nullptr)
       .tableName(tableName)
@@ -112,9 +108,7 @@ PlanBuilder& PlanBuilder::tableScanWithPushDown(
     const PushdownConfig& pushdownConfig,
     const std::string& remainingFilter,
     const RowTypePtr& dataColumns,
-    const std::unordered_map<
-        std::string,
-        std::shared_ptr<connector::ColumnHandle>>& assignments) {
+    const connector::ColumnHandleMap& assignments) {
   return TableScanBuilder(*this)
       .filtersAsNode(filtersAsNode_ ? planNodeIdGenerator_ : nullptr)
       .outputType(outputType)
@@ -129,9 +123,9 @@ PlanBuilder& PlanBuilder::tpchTableScan(
     tpch::Table table,
     std::vector<std::string> columnNames,
     double scaleFactor,
-    std::string_view connectorId) {
-  std::unordered_map<std::string, std::shared_ptr<connector::ColumnHandle>>
-      assignmentsMap;
+    std::string_view connectorId,
+    const std::string& filter) {
+  connector::ColumnHandleMap assignmentsMap;
   std::vector<TypePtr> outputTypes;
 
   assignmentsMap.reserve(columnNames.size());
@@ -144,11 +138,24 @@ PlanBuilder& PlanBuilder::tpchTableScan(
     outputTypes.emplace_back(resolveTpchColumn(table, columnName));
   }
   auto rowType = ROW(std::move(columnNames), std::move(outputTypes));
+
+  core::TypedExprPtr filterExpression;
+  if (!filter.empty()) {
+    auto expression = parse::parseExpr(filter, options_);
+    filterExpression =
+        core::Expressions::inferTypes(expression, rowType, pool_);
+  }
+
+  auto tableHandle = std::make_shared<connector::tpch::TpchTableHandle>(
+      std::string(connectorId),
+      table,
+      scaleFactor,
+      std::move(filterExpression));
+
   return TableScanBuilder(*this)
       .filtersAsNode(filtersAsNode_ ? planNodeIdGenerator_ : nullptr)
       .outputType(rowType)
-      .tableHandle(std::make_shared<connector::tpch::TpchTableHandle>(
-          std::string(connectorId), table, scaleFactor))
+      .tableHandle(tableHandle)
       .assignments(assignmentsMap)
       .endTableScan();
 }
@@ -429,9 +436,9 @@ parseOrderByClauses(
   std::vector<std::shared_ptr<const core::FieldAccessTypedExpr>> sortingKeys;
   std::vector<core::SortOrder> sortingOrders;
   for (const auto& key : keys) {
-    auto [untypedExpr, sortOrder] = parse::parseOrderByExpr(key);
+    auto orderBy = parse::parseOrderByExpr(key);
     auto typedExpr =
-        core::Expressions::inferTypes(untypedExpr, inputType, pool);
+        core::Expressions::inferTypes(orderBy.expr, inputType, pool);
 
     auto sortingKey =
         std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(typedExpr);
@@ -440,7 +447,7 @@ parseOrderByClauses(
         "ORDER BY clause must use a column name, not an expression: {}",
         key);
     sortingKeys.emplace_back(sortingKey);
-    sortingOrders.emplace_back(sortOrder);
+    sortingOrders.emplace_back(orderBy.ascending, orderBy.nullsFirst);
   }
 
   return {sortingKeys, sortingOrders};
@@ -480,7 +487,7 @@ PlanBuilder& PlanBuilder::projectExpressions(
     } else if (
         auto fieldExpr =
             dynamic_cast<const core::FieldAccessExpr*>(projections[i].get())) {
-      projectNames.push_back(fieldExpr->getFieldName());
+      projectNames.push_back(fieldExpr->name());
     } else {
       projectNames.push_back(fmt::format("p{}", i));
     }
@@ -502,7 +509,7 @@ PlanBuilder& PlanBuilder::projectExpressions(
     expressions.push_back(projections[i]);
     if (auto fieldExpr =
             dynamic_cast<const core::FieldAccessExpr*>(projections[i].get())) {
-      projectNames.push_back(fieldExpr->getFieldName());
+      projectNames.push_back(fieldExpr->name());
     } else {
       projectNames.push_back(fmt::format("p{}", i));
     }
@@ -519,6 +526,7 @@ PlanBuilder& PlanBuilder::projectExpressions(
 PlanBuilder& PlanBuilder::project(const std::vector<std::string>& projections) {
   VELOX_CHECK_NOT_NULL(planNode_, "Project cannot be the source node");
   std::vector<std::shared_ptr<const core::IExpr>> expressions;
+  expressions.reserve(projections.size());
   for (auto i = 0; i < projections.size(); ++i) {
     expressions.push_back(parse::parseExpr(projections[i], options_));
   }
@@ -742,7 +750,7 @@ class AggregateTypeResolver {
       const std::vector<core::TypedExprPtr>& inputs,
       const std::shared_ptr<const core::CallExpr>& expr,
       bool nullOnFailure) const {
-    auto functionName = expr->getFunctionName();
+    auto functionName = expr->name();
 
     // Use raw input types (if available) to resolve intermediate and final
     // result types.
@@ -964,17 +972,17 @@ PlanBuilder::AggregatesAndNames PlanBuilder::createAggregateExpressionsAndNames(
       }
     }
 
-    for (const auto& [keyExpr, order] : untypedExpr.orderBy) {
+    for (const auto& orderBy : untypedExpr.orderBy) {
       auto sortingKey =
           std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(
-              inferTypes(keyExpr));
+              inferTypes(orderBy.expr));
       VELOX_CHECK_NOT_NULL(
           sortingKey,
           "ORDER BY clause must use a column name, not an expression: {}",
           aggregate);
 
       agg.sortingKeys.push_back(sortingKey);
-      agg.sortingOrders.push_back(order);
+      agg.sortingOrders.emplace_back(orderBy.ascending, orderBy.nullsFirst);
     }
 
     aggs.emplace_back(agg);
@@ -1073,7 +1081,7 @@ PlanBuilder& PlanBuilder::groupId(
         fieldAccessExpr,
         "Grouping key {} is not valid projection",
         groupingKey);
-    std::string inputField = fieldAccessExpr->getFieldName();
+    std::string inputField = fieldAccessExpr->name();
     std::string outputField = untypedExpr->alias().has_value()
         ?
         // This is a projection with a column alias with the format
@@ -1081,7 +1089,7 @@ PlanBuilder& PlanBuilder::groupId(
         untypedExpr->alias().value()
         :
         // This is a projection without a column alias.
-        fieldAccessExpr->getFieldName();
+        fieldAccessExpr->name();
 
     core::GroupIdNode::GroupingKeyInfo keyInfos;
     keyInfos.output = outputField;
@@ -1145,7 +1153,7 @@ PlanBuilder& PlanBuilder::expand(
           auto fieldExpr = dynamic_cast<const core::FieldAccessExpr*>(
               untypedExpression.get());
           VELOX_CHECK_NOT_NULL(fieldExpr);
-          aliases.push_back(fieldExpr->getFieldName());
+          aliases.push_back(fieldExpr->name());
         }
         projectExpr.push_back(typedExpression);
       } else {
@@ -1933,7 +1941,8 @@ PlanBuilder& PlanBuilder::indexLookupJoin(
 PlanBuilder& PlanBuilder::unnest(
     const std::vector<std::string>& replicateColumns,
     const std::vector<std::string>& unnestColumns,
-    const std::optional<std::string>& ordinalColumn) {
+    const std::optional<std::string>& ordinalColumn,
+    const std::optional<std::string>& emptyUnnestValueName) {
   VELOX_CHECK_NOT_NULL(planNode_, "Unnest cannot be the source node");
   std::vector<std::shared_ptr<const core::FieldAccessTypedExpr>>
       replicateFields;
@@ -1969,6 +1978,7 @@ PlanBuilder& PlanBuilder::unnest(
       unnestFields,
       unnestNames,
       ordinalColumn,
+      emptyUnnestValueName,
       planNode_);
   VELOX_CHECK(planNode_->supportsBarrier());
   return *this;
@@ -2046,7 +2056,7 @@ class WindowTypeResolver {
       types.push_back(input->type());
     }
 
-    auto functionName = expr->getFunctionName();
+    const auto& functionName = expr->name();
 
     return resolveWindowType(functionName, types, nullOnFailure);
   }
@@ -2121,8 +2131,9 @@ parseOrderByKeys(
   std::vector<core::FieldAccessTypedExprPtr> sortingKeys;
   std::vector<core::SortOrder> sortingOrders;
 
-  for (const auto& [untypedExpr, sortOrder] : windowExpr.orderBy) {
-    auto typedExpr = core::Expressions::inferTypes(untypedExpr, inputRow, pool);
+  for (const auto& orderBy : windowExpr.orderBy) {
+    auto typedExpr =
+        core::Expressions::inferTypes(orderBy.expr, inputRow, pool);
     auto sortingKey =
         std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(typedExpr);
     VELOX_CHECK_NOT_NULL(
@@ -2130,7 +2141,7 @@ parseOrderByKeys(
         "ORDER BY clause must use a column name, not an expression: {}",
         windowString);
     sortingKeys.emplace_back(sortingKey);
-    sortingOrders.emplace_back(sortOrder);
+    sortingOrders.emplace_back(orderBy.ascending, orderBy.nullsFirst);
   }
   return {sortingKeys, sortingOrders};
 }
@@ -2281,7 +2292,8 @@ PlanBuilder& PlanBuilder::rowNumber(
   return *this;
 }
 
-PlanBuilder& PlanBuilder::topNRowNumber(
+PlanBuilder& PlanBuilder::topNRank(
+    std::string_view function,
     const std::vector<std::string>& partitionKeys,
     const std::vector<std::string>& sortingKeys,
     int32_t limit,
@@ -2295,6 +2307,7 @@ PlanBuilder& PlanBuilder::topNRowNumber(
   }
   planNode_ = std::make_shared<core::TopNRowNumberNode>(
       nextPlanNodeId(),
+      core::TopNRowNumberNode::rankFunctionFromName(function),
       fields(partitionKeys),
       sortingFields,
       sortingOrders,
@@ -2303,6 +2316,15 @@ PlanBuilder& PlanBuilder::topNRowNumber(
       planNode_);
   VELOX_CHECK(!planNode_->supportsBarrier());
   return *this;
+}
+
+PlanBuilder& PlanBuilder::topNRowNumber(
+    const std::vector<std::string>& partitionKeys,
+    const std::vector<std::string>& sortingKeys,
+    int32_t limit,
+    bool generateRowNumber) {
+  return topNRank(
+      "row_number", partitionKeys, sortingKeys, limit, generateRowNumber);
 }
 
 PlanBuilder& PlanBuilder::markDistinct(
